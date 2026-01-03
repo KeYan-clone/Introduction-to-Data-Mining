@@ -1,2 +1,4 @@
 # Ignore CSV files in assignment 3 directory
-*.csv
+data/
+docs/
+code/__pycache__/
