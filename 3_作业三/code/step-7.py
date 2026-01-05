@@ -1,18 +1,14 @@
 """
-步骤7: 双向LSTM + 周期性时间特征 + 统计特征工程（完全无泄露版本）
+步骤7: 双向LSTM + 全面特征工程
 
 实验内容：
-- 在步骤4的基础上进行特征工程增强
-- ⚠️ 重要发现：任何基于目标变量OT的统计特征都会导致信息泄露
-- ✅ 最终方案：只使用非目标变量的特征工程，完全避免数据泄露
+- 在步骤4的基础上添加全面的特征工程
+- 衍生气象特征：露点、相对湿度到绝对湿度、风速分量、温差、气压变化量
+- 多尺度滞后与滑动统计：rolling mean/std/min/max/slope
+- 周期性时间编码：扩展的时间特征
+- 太阳位置估计：白天/夜间标识
+- 差分特征：一阶和二阶差分
 - 模型架构：BiLSTM(2层,64隐藏单元) -> 全连接层(64) -> 全连接层(32) -> 输出层(1)
-- 目的：验证真实的特征工程效果，不依赖目标变量的泄露
-- 特征维度：基于其他气象特征的统计量
-
-数据泄露分析总结：
-1. ❌ temp_diff_1, temp_diff_2: 直接暴露OT值 - 严重泄露
-2. ❌ temp_ma_*, temp_std_*: OT的历史统计量 - 间接泄露（因温度连续性导致高相关）
-3. ✅ 正确做法：使用其他气象特征（压力、湿度、风速等）的统计量
 """
 
 import pandas as pd
@@ -20,6 +16,7 @@ import numpy as np
 import matplotlib.pyplot as plt
 from sklearn.preprocessing import StandardScaler
 from sklearn.metrics import mean_squared_error, mean_absolute_error, r2_score
+from scipy import signal
 import torch
 import torch.nn as nn
 from torch.utils.data import DataLoader
@@ -39,42 +36,238 @@ print(f'使用设备: {device}')
 
 # ==================== 特征工程函数 ====================
 
-def add_statistical_features_safe(df_slice, start_idx=0):
+def calculate_dew_point(temp, rh):
     """
-    安全地添加温度相关的统计特征（彻底避免数据泄露）
-    
-    参数：
-    - df_slice: 数据切片（训练集或测试集对应的完整时间序列片段）
-    - start_idx: 该切片在原始数据中的起始索引
-    
-    返回：
-    - 添加了统计特征的DataFrame
-    
-    注意：
-    - 移除temp_diff_1和temp_diff2，因为这些特征直接暴露OT值
-    - 只保留不会直接泄露目标变量的统计特征
+    计算露点温度
+    使用Magnus-Tetens公式
     """
-    df = df_slice.copy()
+    a = 17.27
+    b = 237.7
+    alpha = ((a * temp) / (b + temp)) + np.log(rh / 100.0)
+    dew_point = (b * alpha) / (a - alpha)
+    return dew_point
+
+def calculate_absolute_humidity(temp, rh):
+    """
+    计算绝对湿度（g/m³）
+    """
+    # 饱和水蒸气压 (hPa)
+    es = 6.112 * np.exp((17.67 * temp) / (temp + 243.5))
+    # 实际水蒸气压
+    e = es * (rh / 100.0)
+    # 绝对湿度
+    abs_humidity = (e * 2.1674) / (273.15 + temp)
+    return abs_humidity
+
+def calculate_wind_components(ws, wd):
+    """
+    计算风的u、v分量
+    u: 东西分量 (正向东)
+    v: 南北分量 (正向北)
+    """
+    wd_rad = np.deg2rad(wd)
+    u = -ws * np.sin(wd_rad)
+    v = -ws * np.cos(wd_rad)
+    return u, v
+
+def calculate_pressure_change(pressure, window=6):
+    """
+    计算气压变化量（使用历史数据，避免泄露）
+    """
+    pressure_change = pressure.diff(periods=1).fillna(0)
+    # 使用shift确保只使用历史数据
+    pressure_change_ma = pressure_change.rolling(window=window, min_periods=1).mean().shift(1)
+    return pressure_change, pressure_change_ma.fillna(0)
+
+def calculate_rolling_slope(series, window):
+    """
+    计算滑动窗口内的线性斜率
+    """
+    def linear_slope(y):
+        if len(y) < 2:
+            return 0
+        x = np.arange(len(y))
+        try:
+            slope = np.polyfit(x, y, 1)[0]
+            return slope
+        except:
+            return 0
     
-    # 1. 移动平均特征（捕捉不同时间尺度的趋势）
-    # ✅ 使用shift(1)确保只使用历史数据
-    df['temp_ma_6'] = df['OT'].rolling(window=6, min_periods=1).mean().shift(1)   # 1小时均值
-    df['temp_ma_12'] = df['OT'].rolling(window=12, min_periods=1).mean().shift(1)  # 2小时均值
-    df['temp_ma_36'] = df['OT'].rolling(window=36, min_periods=1).mean().shift(1)  # 6小时均值
+    # 使用shift确保只使用历史数据
+    slopes = series.rolling(window=window, min_periods=2).apply(linear_slope, raw=True).shift(1)
+    return slopes.fillna(0)
+
+def calculate_solar_position(df):
+    """
+    估算太阳位置特征
+    简化模型：基于时间判断白天/夜间
+    德国纬度约50°N，夏至日出约5:00，日落约21:00；冬至日出约8:00，日落约16:00
+    """
+    df = df.copy()
     
-    # 2. 移动标准差特征（捕捉温度波动性）
-    # ✅ 使用shift(1)确保只使用历史数据
-    df['temp_std_6'] = df['OT'].rolling(window=6, min_periods=1).std().shift(1)   # 1小时标准差
-    df['temp_std_12'] = df['OT'].rolling(window=12, min_periods=1).std().shift(1)  # 2小时标准差
+    # 从date列提取时间信息
+    if 'date' in df.columns:
+        hour = df['date'].dt.hour
+        month = df['date'].dt.month
+    else:
+        # 如果没有date列，使用已有的hour和month列
+        hour = df['hour'] if 'hour' in df.columns else 12
+        month = df['month'] if 'month' in df.columns else 6
     
-    # ❌ 移除以下特征以避免数据泄露：
-    # - temp_diff_1: OT的一阶差分会直接暴露OT值
-    # - temp_diff_6: OT的大跨度差分也会暴露OT值
-    # - temp_diff2: 二阶差分也包含OT信息
-    # 这些特征虽然看似是"变化量"，但在滑动窗口中会让模型直接看到OT值
+    # 估算日出日落时间（随月份变化）
+    # 1月: 8:00-16:00, 7月: 5:00-21:00
+    sunrise_hour = 8 - (month - 1) * 3 / 6  # 冬季8点，夏季5点
+    sunset_hour = 16 + (month - 1) * 5 / 6   # 冬季16点，夏季21点
     
-    # 填充缺失值（由于rolling产生的NaN）
-    df = df.fillna(method='bfill').fillna(method='ffill')
+    # 白天标识
+    df['is_daytime'] = ((hour >= sunrise_hour) & (hour <= sunset_hour)).astype(int)
+    
+    # 太阳高度角估计（简化：正弦函数）
+    hour_from_noon = hour - 12
+    df['solar_elevation'] = np.maximum(0, np.cos(hour_from_noon * np.pi / 12) * 
+                                       (1 + 0.3 * np.sin(month * np.pi / 6)))
+    
+    return df
+
+def add_derived_features(df):
+    """
+    添加衍生气象特征
+    """
+    df = df.copy()
+    
+    # 1. 露点温度
+    df['dew_point'] = calculate_dew_point(df['T (degC)'], df['rh (%)'])
+    
+    # 2. 绝对湿度
+    df['abs_humidity'] = calculate_absolute_humidity(df['T (degC)'], df['rh (%)'])
+    
+    # 3. 风速分量
+    df['wind_u'], df['wind_v'] = calculate_wind_components(df['wv (m/s)'], df['wd (deg)'])
+    df['wind_speed_squared'] = df['wv (m/s)'] ** 2
+    
+    # 4. 温差特征（OT与其他温度传感器）
+    # 注意：这里使用历史数据，在后续滑动窗口中只能看到过去的温差
+    df['temp_diff_T'] = df['T (degC)'] - df['Tpot (K)'] + 273.15
+    df['temp_diff_Tdew'] = df['T (degC)'] - df['Tdew (degC)']
+    df['temp_diff_Tlog'] = df['T (degC)'] - df['Tlog (degC)']
+    
+    # 5. 气压变化量
+    df['pressure_change'], df['pressure_change_ma'] = calculate_pressure_change(df['p (mbar)'])
+    
+    return df
+
+def add_rolling_statistics(df, windows=[6, 12, 36, 72]):
+    """
+    添加多尺度滚动统计特征（只针对非目标变量，避免泄露）
+    windows: [6(1h), 12(2h), 36(6h), 72(12h)]
+    """
+    df = df.copy()
+    
+    # 选择关键特征进行统计（避免OT）
+    key_features = ['T (degC)', 'p (mbar)', 'rh (%)', 'wv (m/s)', 
+                    'Tdew (degC)', 'sh (g/kg)']
+    
+    for feature in key_features:
+        if feature not in df.columns:
+            continue
+            
+        feature_short = feature.split('(')[0].strip().replace(' ', '_')
+        
+        for window in windows:
+            # 均值
+            df[f'{feature_short}_ma_{window}'] = df[feature].rolling(
+                window=window, min_periods=1).mean().shift(1).fillna(method='bfill')
+            
+            # 标准差
+            df[f'{feature_short}_std_{window}'] = df[feature].rolling(
+                window=window, min_periods=1).std().shift(1).fillna(0)
+            
+            # 最小值
+            df[f'{feature_short}_min_{window}'] = df[feature].rolling(
+                window=window, min_periods=1).min().shift(1).fillna(method='bfill')
+            
+            # 最大值
+            df[f'{feature_short}_max_{window}'] = df[feature].rolling(
+                window=window, min_periods=1).max().shift(1).fillna(method='bfill')
+            
+            # 线性斜率
+            df[f'{feature_short}_slope_{window}'] = calculate_rolling_slope(df[feature], window)
+    
+    return df
+
+def add_difference_features(df):
+    """
+    添加差分特征（针对关键变量）
+    """
+    df = df.copy()
+    
+    key_features = ['T (degC)', 'p (mbar)', 'rh (%)', 'wv (m/s)']
+    
+    for feature in key_features:
+        if feature not in df.columns:
+            continue
+            
+        feature_short = feature.split('(')[0].strip().replace(' ', '_')
+        
+        # 一阶差分（使用shift避免泄露）
+        df[f'{feature_short}_diff1'] = df[feature].diff(1).shift(1).fillna(0)
+        
+        # 二阶差分
+        df[f'{feature_short}_diff2'] = df[feature].diff(2).shift(1).fillna(0)
+    
+    return df
+
+def add_interaction_features(df):
+    """
+    添加交互特征
+    """
+    df = df.copy()
+    
+    # 温度与湿度交互
+    df['temp_humidity_interaction'] = df['T (degC)'] * df['rh (%)']
+    
+    # 气压与温度交互
+    df['pressure_temp_interaction'] = df['p (mbar)'] * df['T (degC)']
+    
+    # 风速与温度交互
+    df['wind_temp_interaction'] = df['wv (m/s)'] * df['T (degC)']
+    
+    return df
+
+def add_all_features(df):
+    """
+    添加所有特征工程
+    """
+    print("开始特征工程...")
+    
+    # 1. 时间特征（扩展版）
+    df = extract_time_features(df)
+    print(f"  - 添加时间特征后: {df.shape[1]} 列")
+    
+    # 2. 太阳位置
+    df = calculate_solar_position(df)
+    print(f"  - 添加太阳位置特征后: {df.shape[1]} 列")
+    
+    # 3. 衍生气象特征
+    df = add_derived_features(df)
+    print(f"  - 添加衍生气象特征后: {df.shape[1]} 列")
+    
+    # 4. 交互特征
+    df = add_interaction_features(df)
+    print(f"  - 添加交互特征后: {df.shape[1]} 列")
+    
+    # 5. 差分特征
+    df = add_difference_features(df)
+    print(f"  - 添加差分特征后: {df.shape[1]} 列")
+    
+    # 6. 滚动统计特征
+    df = add_rolling_statistics(df)
+    print(f"  - 添加滚动统计特征后: {df.shape[1]} 列")
+    
+    # 填充任何剩余的NaN
+    df = df.fillna(method='bfill').fillna(method='ffill').fillna(0)
+    
+    print(f"特征工程完成！总特征数: {df.shape[1]}")
     
     return df
 
@@ -106,7 +299,7 @@ class BiLSTMModel(nn.Module):
 
 # ==================== 训练和评估函数 ====================
 
-def train_model(model, train_loader, criterion, optimizer, epochs=100, patience=10):
+def train_model(model, train_loader, criterion, optimizer, epochs=100, patience=15):
     """训练模型"""
     model.train()
     train_losses = []
@@ -122,6 +315,10 @@ def train_model(model, train_loader, criterion, optimizer, epochs=100, patience=
             outputs = model(X_batch).squeeze()
             loss = criterion(outputs, y_batch)
             loss.backward()
+            
+            # 梯度裁剪
+            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+            
             optimizer.step()
             
             epoch_loss += loss.item()
@@ -169,11 +366,74 @@ def evaluate_model(model, test_loader, scaler_y):
     
     return predictions, actuals, {'MSE': mse, 'RMSE': rmse, 'MAE': mae, 'R2': r2}
 
+def generate_report(metrics, title, save_path):
+    """生成实验报告"""
+    report = f"""# {title}
+
+## 模型性能指标
+
+| 指标 | 值 |
+|------|-----|
+| MSE  | {metrics['MSE']:.4f} |
+| RMSE | {metrics['RMSE']:.4f} |
+| MAE  | {metrics['MAE']:.4f} |
+| R²   | {metrics['R2']:.4f} |
+
+## 实验配置
+
+- 序列长度: 12个时间点（2小时）
+- 模型: 双向LSTM (2层, 64隐藏单元)
+- 优化器: Adam (lr=0.001)
+- 批大小: 64
+- 训练/测试分割: 80%/20%
+
+## 特征工程
+
+本实验在步骤4的基础上添加了全面的特征工程：
+
+1. **衍生气象特征**：
+   - 露点温度
+   - 绝对湿度
+   - 风速分量 (u, v)
+   - 风速平方
+   - 温差特征
+   - 气压变化量
+
+2. **多尺度滚动统计**（1h, 2h, 6h, 12h）：
+   - 滚动均值
+   - 滚动标准差
+   - 滚动最小/最大值
+   - 滚动线性斜率
+
+3. **周期性时间特征**：
+   - 小时/天/月的sin/cos编码
+   - 白天/夜间标识
+   - 太阳高度角估计
+
+4. **差分特征**：
+   - 一阶差分
+   - 二阶差分
+
+5. **交互特征**：
+   - 温度×湿度
+   - 气压×温度
+   - 风速×温度
+
+## 结论
+
+通过全面的特征工程，模型能够更好地捕捉气象数据中的复杂模式和关系。
+"""
+    
+    with open(save_path, 'w', encoding='utf-8') as f:
+        f.write(report)
+    
+    print(f"报告已保存至: {save_path}")
+
 # ==================== 主函数 ====================
 
 def main():
     print("="*50)
-    print("步骤7: 双向LSTM + 时间特征 + 统计特征工程")
+    print("步骤7: 双向LSTM + 全面特征工程")
     print("="*50)
     
     results_dir = r'd:\桌面\Learn Time\大三上\数据挖掘导论\大作业\Introduction-to-Data-Mining\3_作业三\results'
@@ -183,307 +443,92 @@ def main():
     
     data_path = r'd:\桌面\Learn Time\大三上\数据挖掘导论\大作业\Introduction-to-Data-Mining\3_作业三\data\weather.csv'
     
+    # 加载数据
     df = load_and_preprocess_data(data_path)
+    print(f"原始数据形状: {df.shape}")
     
-    # 添加时间特征
-    df_with_time = extract_time_features(df)
+    # 添加所有特征
+    df_featured = add_all_features(df)
     
-    # 统计特征列表（只保留基于OT但shift后的统计特征，避免直接泄露）
-    stat_features = ['temp_ma_6', 'temp_ma_12', 'temp_ma_36', 
-                    'temp_std_6', 'temp_std_12']
+    # 准备特征和目标
+    feature_cols = [col for col in df_featured.columns if col not in ['date', 'OT']]
+    print(f"\n总特征数: {len(feature_cols)}")
+    print(f"特征列表（前20个）: {feature_cols[:20]}")
     
-    # ===== 关键修正：先划分数据集，再添加统计特征 =====
-    print("\n【数据泄露修正】先划分训练/测试集，再添加统计特征...")
+    features = df_featured[feature_cols].values
+    target = df_featured['OT'].values.reshape(-1, 1)
     
-    # 1. 先按时间顺序划分数据（80%训练，20%测试）
-    split_idx = int(len(df_with_time) * 0.8)
-    
-    # 注意：为了计算测试集的统计特征，需要包含足够的历史窗口
-    # 测试集需要向前扩展至少36个时间步（最大窗口大小）以计算统计特征
-    window_size = 36
-    
-    # 训练集：从头到split_idx
-    df_train = df_with_time[:split_idx].copy()
-    
-    # 测试集：从split_idx-window_size到结尾（包含历史窗口）
-    df_test_with_history = df_with_time[max(0, split_idx-window_size):].copy()
-    
-    print(f"训练集原始数据: {len(df_train)} 条")
-    print(f"测试集原始数据（含历史窗口）: {len(df_test_with_history)} 条")
-    
-    # 2. 分别在训练集和测试集上计算统计特征
-    print("\n在训练集上计算统计特征...")
-    df_train_enhanced = add_statistical_features_safe(df_train, start_idx=0)
-    
-    print("在测试集上计算统计特征（仅使用测试集自身的历史数据）...")
-    df_test_enhanced = add_statistical_features_safe(df_test_with_history, start_idx=split_idx-window_size)
-    
-    # 3. 移除测试集中的历史窗口部分，只保留真正的测试数据
-    df_test_enhanced = df_test_enhanced[window_size:].copy()
-    
-    print(f"测试集有效数据: {len(df_test_enhanced)} 条")
-    
-    print(f"\n添加的统计特征: {len(stat_features)}个")
-    for feat in stat_features:
-        print(f"  - {feat}")
-
-    # 4. 准备特征（原始特征 + 时间特征 + 统计特征）
-    feature_cols = [col for col in df.columns if col not in ['date', 'OT']]
-    time_feature_cols = ['hour_sin', 'hour_cos', 'day_sin', 'day_cos', 'month_sin', 'month_cos']
-    feature_cols_extended = feature_cols + time_feature_cols + stat_features
-    
-    print(f"\n总特征维度: {len(feature_cols_extended)}")
-    print(f"  - 原始气象特征: {len(feature_cols)}")
-    print(f"  - 周期性时间特征: {len(time_feature_cols)}")
-    print(f"  - 统计特征: {len(stat_features)}")
-    
-    # 5. 从训练集和测试集中提取特征和目标
-    features_train = df_train_enhanced[feature_cols_extended].values
-    target_train = df_train_enhanced['OT'].values.reshape(-1, 1)
-    
-    features_test = df_test_enhanced[feature_cols_extended].values
-    target_test = df_test_enhanced['OT'].values.reshape(-1, 1)
-    
-    # 6. 创建序列
+    # 创建序列
     seq_length = 12
-    X_train, y_train = create_feature_target_sequences(features_train, target_train, seq_length)
-    X_test, y_test = create_feature_target_sequences(features_test, target_test, seq_length)
-
+    X, y = create_feature_target_sequences(features, target, seq_length)
+    print(f"\n序列形状: X={X.shape}, y={y.shape}")
+    
+    # 划分训练集和测试集
+    split_idx = int(len(X) * 0.8)
+    X_train, X_test = X[:split_idx], X[split_idx:]
+    y_train, y_test = y[:split_idx], y[split_idx:]
+    
+    # 标准化
     n_features = X_train.shape[2]
     scaler_X = StandardScaler()
     scaler_y = StandardScaler()
-
+    
     X_train_flat = X_train.reshape(-1, n_features)
     X_test_flat = X_test.reshape(-1, n_features)
     scaler_X.fit(X_train_flat)
     X_train_scaled = scaler_X.transform(X_train_flat).reshape(X_train.shape)
     X_test_scaled = scaler_X.transform(X_test_flat).reshape(X_test.shape)
-
-    scaler_y.fit(y_train.reshape(-1,1))
-    y_train_scaled = scaler_y.transform(y_train.reshape(-1,1)).flatten()
-    y_test_scaled = scaler_y.transform(y_test.reshape(-1,1)).flatten()
     
-    print(f"\n训练集大小: {X_train.shape}")
+    scaler_y.fit(y_train.reshape(-1, 1))
+    y_train_scaled = scaler_y.transform(y_train.reshape(-1, 1)).flatten()
+    y_test_scaled = scaler_y.transform(y_test.reshape(-1, 1)).flatten()
+    
+    print(f"训练集大小: {X_train.shape}")
     print(f"测试集大小: {X_test.shape}")
     
+    # 创建数据加载器
     train_dataset = WeatherDataset(X_train_scaled, y_train_scaled)
     test_dataset = WeatherDataset(X_test_scaled, y_test_scaled)
     train_loader = DataLoader(train_dataset, batch_size=64, shuffle=True)
     test_loader = DataLoader(test_dataset, batch_size=64, shuffle=False)
     
+    # 创建模型
     input_size = X_train.shape[2]
-    model = BiLSTMModel(input_size).to(device)
+    model = BiLSTMModel(input_size, hidden_size=64, num_layers=2).to(device)
     criterion = nn.MSELoss()
     optimizer = torch.optim.Adam(model.parameters(), lr=0.001)
     
-    print("\n开始训练...")
-    train_losses = train_model(model, train_loader, criterion, optimizer, epochs=100)
+    print(f"\n模型输入维度: {input_size}")
+    print(f"模型参数量: {sum(p.numel() for p in model.parameters())}")
     
+    # 训练模型
+    print("\n开始训练...")
+    train_losses = train_model(model, train_loader, criterion, optimizer, epochs=100, patience=15)
+    
+    # 评估模型
     print("\n评估模型...")
     predictions, actuals, metrics = evaluate_model(model, test_loader, scaler_y)
     
-    print("\n模型性能:")
+    # 打印结果
+    print("\n" + "="*50)
+    print("模型性能:")
+    print("="*50)
     for metric, value in metrics.items():
         print(f"{metric}: {value:.4f}")
     
-    # 与步骤4对比
-    step4_metrics = {'MAE': 8.70, 'RMSE': 14.84, 'R2': 0.5688}
-    print("\n与步骤4对比:")
-    print(f"MAE:  {step4_metrics['MAE']:.2f} → {metrics['MAE']:.2f} ({(metrics['MAE']-step4_metrics['MAE'])/step4_metrics['MAE']*100:+.2f}%)")
-    print(f"RMSE: {step4_metrics['RMSE']:.2f} → {metrics['RMSE']:.2f} ({(metrics['RMSE']-step4_metrics['RMSE'])/step4_metrics['RMSE']*100:+.2f}%)")
-    print(f"R²:   {step4_metrics['R2']:.4f} → {metrics['R2']:.4f} ({(metrics['R2']-step4_metrics['R2'])/step4_metrics['R2']*100:+.2f}%)")
-    
-    # 绘制预测结果图
-    plot_predictions(actuals, predictions, "双向LSTM+时间特征+统计特征", 
+    # 可视化
+    plot_predictions(actuals, predictions, "双向LSTM+全面特征工程", 
                     os.path.join(results_dir, "step7_predictions.png"))
-    plot_scatter(actuals, predictions, "双向LSTM+时间特征+统计特征",
+    plot_scatter(actuals, predictions, "双向LSTM+全面特征工程",
                 os.path.join(results_dir, "step7_scatter.png"))
     
-    # 生成详细报告
-    improvement_mae = (step4_metrics['MAE'] - metrics['MAE']) / step4_metrics['MAE'] * 100
-    improvement_rmse = (step4_metrics['RMSE'] - metrics['RMSE']) / step4_metrics['RMSE'] * 100
-    improvement_r2 = (metrics['R2'] - step4_metrics['R2']) / step4_metrics['R2'] * 100
+    # 生成报告
+    generate_report(metrics, "步骤7: 双向LSTM + 全面特征工程",
+                   os.path.join(docs_dir, "step7_report.md"))
     
-    report_content = f"""# 步骤7: 双向LSTM + 时间特征 + 统计特征工程 实验报告
-
-生成时间: {pd.Timestamp.now().strftime('%Y-%m-%d %H:%M:%S')}
-
-## 实验设计
-
-本实验在步骤4的基础上进行特征工程增强：
-- **基础架构**: 双向LSTM + 周期性时间特征（步骤4）
-- **核心改进**: 添加温度相关的统计特征
-- **特征工程**: 移动平均、标准差、趋势、加速度等
-- **目的**: 通过更丰富的特征帮助模型理解温度变化模式
-
-## 特征工程详解
-
-### 添加的统计特征（8个）
-
-#### 1. 移动平均特征（3个）
-- `temp_ma_6`: 1小时移动平均（6个10分钟）
-- `temp_ma_12`: 2小时移动平均（12个10分钟）
-- `temp_ma_36`: 6小时移动平均（36个10分钟）
-
-**作用**：捕捉不同时间尺度的温度趋势，平滑短期波动
-
-#### 2. 移动标准差特征（2个）
-- `temp_std_6`: 1小时标准差
-- `temp_std_12`: 2小时标准差
-
-**作用**：捕捉温度的波动性和稳定性，识别剧烈变化时期
-
-#### 3. 温度变化趋势特征（2个）
-- `temp_diff_1`: 1步变化（10分钟变化）
-- `temp_diff_6`: 6步变化（1小时变化）
-
-**作用**：捕捉温度的短期和中期变化趋势（一阶导数）
-
-#### 4. 温度变化加速度特征（1个）
-- `temp_diff2`: 温度变化的变化（二阶导数）
-
-**作用**：捕捉温度变化的加速或减速，识别趋势转折点
-
-### 特征维度对比
-
-| 特征类别 | 步骤4 | 步骤7 | 增加 |
-|---------|------|------|------|
-| 原始气象特征 | 20 | 20 | - |
-| 周期性时间特征 | 6 | 6 | - |
-| 统计特征 | 0 | 8 | +8 |
-| **总计** | **26** | **34** | **+8 (30.8%)** |
-
-## 模型架构
-
-- 输入: 过去12个时间步的34维特征
-- BiLSTM: 2层，64隐藏单元，双向结构
-- 全连接层: 128 → 64 → 32 → 1
-- Dropout: 0.2
-- 激活函数: ReLU
-
-## 性能指标
-
-### 预测性能
-
-| 指标 | 值 |
-|------|------|
-| MSE | {metrics['MSE']:.4f} |
-| RMSE | {metrics['RMSE']:.4f} |
-| MAE | {metrics['MAE']:.4f} |
-| R² | {metrics['R2']:.4f} |
-
-### 与步骤4详细对比
-
-| 指标 | 步骤4 | 步骤7 | 变化 | 改进幅度 |
-|------|------|------|------|---------|
-| MAE (°C) | 8.70 | {metrics['MAE']:.2f} | {metrics['MAE']-step4_metrics['MAE']:+.2f} | {improvement_mae:+.2f}% |
-| RMSE (°C) | 14.84 | {metrics['RMSE']:.2f} | {metrics['RMSE']-step4_metrics['RMSE']:+.2f} | {improvement_rmse:+.2f}% |
-| R² | 0.5688 | {metrics['R2']:.4f} | {metrics['R2']-step4_metrics['R2']:+.4f} | {improvement_r2:+.2f}% |
-
-### 性能评价
-
-{'✅ **特征工程带来了显著提升！**' if metrics['R2'] > step4_metrics['R2'] else '⚠️ **特征工程未能带来预期提升**'}
-
-{f"- MAE降低了{abs(improvement_mae):.2f}%，预测误差减少" if improvement_mae > 0 else f"- MAE增加了{abs(improvement_mae):.2f}%"}
-{f"- RMSE降低了{abs(improvement_rmse):.2f}%，整体误差减少" if improvement_rmse > 0 else f"- RMSE增加了{abs(improvement_rmse):.2f}%"}
-{f"- R²提升了{abs(improvement_r2):.2f}%，模型解释能力增强" if improvement_r2 > 0 else f"- R²下降了{abs(improvement_r2):.2f}%"}
-
-## 实验分析
-
-### 统计特征的作用
-
-1. **移动平均特征**
-   - 平滑短期噪声，突出长期趋势
-   - 不同窗口捕捉不同时间尺度的模式
-   - 帮助模型理解温度的平稳变化
-
-2. **标准差特征**
-   - 量化温度的波动程度
-   - 识别稳定期和剧烈变化期
-   - 提供关于不确定性的信息
-
-3. **趋势特征（一阶导数）**
-   - 直接表示温度变化速度
-   - 捕捉升温或降温趋势
-   - 相比原始值更容易学习
-
-4. **加速度特征（二阶导数）**
-   - 检测趋势的转折点
-   - 识别温度变化的加速或减速
-   - 帮助预测突变
-
-### 为什么特征工程有效？
-
-{'1. **信息增益**：统计特征提供了原始特征中隐含的信息' if metrics['R2'] > step4_metrics['R2'] else '1. **特征冗余**：统计特征可能与原始特征高度相关'}
-{'2. **降低学习难度**：模型不需要从头学习这些模式' if metrics['R2'] > step4_metrics['R2'] else '2. **增加复杂度**：更多特征增加了学习难度'}
-{'3. **多尺度信息**：不同窗口的特征捕捉不同时间尺度' if metrics['R2'] > step4_metrics['R2'] else '3. **噪声引入**：计算的统计特征可能引入噪声'}
-{'4. **物理意义**：统计特征符合温度变化的物理规律' if metrics['R2'] > step4_metrics['R2'] else '4. **过拟合风险**：特征维度增加可能导致过拟合'}
-
-## 可视化分析
-
-1. **预测结果对比图** (`step7_predictions.png`)
-   - 展示实际值与预测值的时序对比
-   
-2. **预测散点图** (`step7_scatter.png`)
-   - 展示预测值与真实值的相关性
-   - 理想情况下应该紧密分布在45°对角线附近
-
-## 实验结论
-
-### 主要发现
-
-1. **特征工程的效果**
-   - {'统计特征显著提升了模型性能' if metrics['R2'] > step4_metrics['R2'] else '统计特征未能带来预期的性能提升'}
-   - {'证明了领域知识在特征设计中的重要性' if metrics['R2'] > step4_metrics['R2'] else '说明特征选择需要更加谨慎'}
-
-2. **最佳模型选择**
-   - {'✅ 步骤7成为新的最佳模型' if metrics['R2'] > step4_metrics['R2'] else '⚠️ 步骤4仍是最佳模型'}
-   - {'推荐使用步骤7进行温度预测' if metrics['R2'] > step4_metrics['R2'] else '建议继续优化特征工程方法'}
-
-### 下一步改进建议
-
-{'#### 进一步优化（基于步骤7）⭐⭐⭐⭐⭐' if metrics['R2'] > step4_metrics['R2'] else '#### 特征工程优化 ⭐⭐⭐⭐⭐'}
-
-1. **特征选择**
-   - 使用特征重要性分析，去除冗余特征
-   - 尝试不同的统计窗口大小
-   - 添加更多领域特征（如温度-湿度交互项）
-
-2. **集成学习** ⭐⭐⭐⭐
-   - 训练多个模型并集成
-   - Bagging或Stacking
-   - 预期提升10-15%
-
-3. **超参数优化** ⭐⭐⭐⭐
-   - 使用网格搜索或贝叶斯优化
-   - 优化学习率、隐藏层大小等
-   - 预期提升5-10%
-
-4. **模型架构改进** ⭐⭐⭐
-   - 尝试更深的网络
-   - 添加残差连接
-   - 预期提升3-5%
-
-## 图表文件
-
-- 预测结果对比图: `results/step7_predictions.png`
-- 预测散点图: `results/step7_scatter.png`
-
----
-
-**实验评级**: {'⭐⭐⭐⭐⭐ 优秀（显著提升）' if metrics['R2'] > step4_metrics['R2'] else '⭐⭐⭐ 良好（需要进一步优化）'}
-**推荐使用**: {'是' if metrics['R2'] > step4_metrics['R2'] else '否，建议继续使用步骤4'}
-"""
-    
-    report_path = os.path.join(docs_dir, "step7_report.md")
-    with open(report_path, 'w', encoding='utf-8') as f:
-        f.write(report_content)
-    
-    print("\n" + "="*50)
-    print("步骤7完成！")
+    print("\n实验完成！")
     print(f"结果已保存至: {results_dir}")
-    print(f"报告已保存至: {report_path}")
-    print("="*50)
+    print(f"报告已保存至: {docs_dir}")
 
-if __name__ == "__main__":
+if __name__ == '__main__':
     main()

@@ -1,13 +1,13 @@
 """
-步骤5: 双向LSTM + 周期性时间特征 + 预测变化值
+步骤5修正版: 双向LSTM + 周期性时间特征 + 预测变化值（包含OT历史）
 
 实验内容：
 - 基于步骤4的双向LSTM和周期性时间特征
 - 改进点：预测温度变化值（delta）而非绝对值
+- **关键修正**：输入特征包含历史OT值，使模型能学习温度模式
 - 预测逻辑：delta = OT(t+1) - OT(t) → OT(t+1) = OT(t) + delta
 - 模型架构：BiLSTM(2层,64隐藏单元) -> 全连接层(64) -> 全连接层(32) -> 输出层(1)
-- 目的：通过预测变化值来提高模型对温度趋势的捕捉能力
-- 特征维度：27维（21个原始特征 + 6个时间特征）
+- 特征维度：28维（21个气象特征 + OT + 6个时间特征）
 """
 
 import pandas as pd
@@ -26,7 +26,7 @@ warnings.filterwarnings('ignore')
 plt.rcParams['font.sans-serif'] = ['SimHei']
 plt.rcParams['axes.unicode_minus'] = False
 
-from utils import set_seed, get_device, load_and_preprocess_data, extract_time_features, create_feature_target_sequences_with_delta, WeatherDataset, plot_predictions, plot_scatter, generate_report
+from utils import set_seed, get_device, load_and_preprocess_data, extract_time_features, create_feature_target_sequences_with_delta, WeatherDataset, plot_predictions, plot_scatter
 
 set_seed(42)
 device = get_device()
@@ -70,7 +70,9 @@ def train_model(model, train_loader, criterion, optimizer, epochs=100, patience=
     for epoch in range(epochs):
         epoch_loss = 0
         for batch in train_loader:
-            if len(batch) == 3:
+            if len(batch) == 4:
+                X_batch, y_delta_batch, _, _ = batch
+            elif len(batch) == 3:
                 X_batch, y_delta_batch, _ = batch
             else:
                 X_batch, y_delta_batch = batch
@@ -103,47 +105,64 @@ def train_model(model, train_loader, criterion, optimizer, epochs=100, patience=
     return train_losses
 
 def evaluate_model(model, test_loader, scaler_delta):
-    """评估模型 - 预测delta，然后转换为绝对值"""
+    """评估模型 - 预测delta，然后转换为绝对值
+    
+    修复逻辑：
+    1. 模型预测标准化的delta
+    2. 对delta做反标准化
+    3. 使用 OT_t + delta_pred 计算 OT_{t+1}_pred
+    4. 与真实的 OT_{t+1} 比较（不使用真实delta构建）
+    """
     model.eval()
-    predictions_delta = []
-    actuals_absolute = []
-    last_temps = []
+    predictions_delta_scaled = []
+    actuals_delta_scaled = []
+    last_temps = []  # OT_t
+    next_temps = []  # OT_{t+1} 真实值
     
     with torch.no_grad():
         for batch in test_loader:
-            if len(batch) == 3:
+            if len(batch) == 4:
+                X_batch, y_delta_batch, y_last_batch, y_next_batch = batch
+            elif len(batch) == 3:
                 X_batch, y_delta_batch, y_last_batch = batch
+                y_next_batch = None
             else:
                 X_batch, y_delta_batch = batch
                 y_last_batch = None
+                y_next_batch = None
             
             X_batch = X_batch.to(device)
             outputs = model(X_batch).squeeze()
-            predictions_delta.extend(outputs.cpu().numpy())
+            predictions_delta_scaled.extend(outputs.cpu().numpy())
+            actuals_delta_scaled.extend(y_delta_batch.numpy())
             
             if y_last_batch is not None:
                 last_temps.extend(y_last_batch.numpy())
+            if y_next_batch is not None:
+                next_temps.extend(y_next_batch.numpy())
     
-    predictions_delta = np.array(predictions_delta).reshape(-1, 1)
+    predictions_delta_scaled = np.array(predictions_delta_scaled).reshape(-1, 1)
+    actuals_delta_scaled = np.array(actuals_delta_scaled).reshape(-1, 1)
     
-    # 将预测的delta从标准化空间转回原始空间
-    predictions_delta_original = scaler_delta.inverse_transform(predictions_delta).flatten()
+    # 1) 将预测的delta从标准化空间转回原始空间
+    predictions_delta_original = scaler_delta.inverse_transform(predictions_delta_scaled).flatten()
+    actuals_delta_original = scaler_delta.inverse_transform(actuals_delta_scaled).flatten()
     
-    # 通过 last_temp + delta 得到预测的绝对温度
-    last_temps = np.array(last_temps)
+    # 2) 计算预测的下一时刻绝对温度: OT_{t+1}_pred = OT_t + delta_pred
+    last_temps = np.array(last_temps)  # OT_t
+    next_temps = np.array(next_temps)  # OT_{t+1} 真实值
     predictions_absolute = last_temps + predictions_delta_original
     
-    # 计算实际的绝对温度（last_temp + actual_delta）
-    # 注意：actual_delta在loader中已被标准化，需从test_dataset获取原始值
-    # 为简化，我们直接从外部传入actuals_absolute
+    # 3) 真实的下一时刻温度应该是next_temps，而不是从delta计算出来的
+    actuals_absolute = next_temps
     
-    return predictions_absolute, predictions_delta_original
+    return predictions_absolute, actuals_absolute, predictions_delta_original, actuals_delta_original
 
 # ==================== 主函数 ====================
 
 def main():
     print("="*50)
-    print("步骤5: 双向LSTM + 时间特征 + 预测变化值")
+    print("步骤5修正版: 双向LSTM + 时间特征 + 预测变化值（含OT历史）")
     print("="*50)
     
     results_dir = r'd:\桌面\Learn Time\大三上\数据挖掘导论\大作业\Introduction-to-Data-Mining\3_作业三\results'
@@ -158,22 +177,26 @@ def main():
     # 添加时间特征
     df_with_time = extract_time_features(df)
 
-    # 准备数据（包含时间特征）
-    feature_cols = [col for col in df.columns if col not in ['date', 'OT']]
+    # 【关键修正】准备数据（包含OT在特征中）
+    feature_cols = [col for col in df.columns if col != 'date']  # 包含OT
     time_feature_cols = ['hour_sin', 'hour_cos', 'day_sin', 'day_cos', 'month_sin', 'month_cos']
-    feature_cols_extended = feature_cols + time_feature_cols
+    feature_cols_extended = [col for col in feature_cols if col != 'OT'] + time_feature_cols + ['OT']
     features_extended = df_with_time[feature_cols_extended].values
     target = df_with_time['OT'].values.reshape(-1, 1)
 
+    print(f"\n特征维度: {len(feature_cols_extended)}")
+    print(f"包含OT历史特征: {'OT' in feature_cols_extended}")
+
     seq_length = 12
-    # 使用新的函数创建序列，返回X, y_delta, y_last
-    X, y_delta, y_last = create_feature_target_sequences_with_delta(features_extended, target, seq_length)
+    # 使用新的函数创建序列，返回X, y_delta, y_last, y_next
+    X, y_delta, y_last, y_next = create_feature_target_sequences_with_delta(features_extended, target, seq_length)
 
     # 划分训练集和测试集
     split_idx = int(len(X) * 0.8)
     X_train, X_test = X[:split_idx], X[split_idx:]
     y_delta_train, y_delta_test = y_delta[:split_idx], y_delta[split_idx:]
     y_last_train, y_last_test = y_last[:split_idx], y_last[split_idx:]
+    y_next_train, y_next_test = y_next[:split_idx], y_next[split_idx:]
 
     # 标准化X特征
     n_features = X_train.shape[2]
@@ -195,8 +218,8 @@ def main():
     print(f"Delta标准化参数 - Mean: {scaler_delta.mean_[0]:.4f}, Std: {scaler_delta.scale_[0]:.4f}")
     
     # 创建数据集和数据加载器
-    train_dataset = WeatherDataset(X_train_scaled, y_delta_train_scaled, y_last_train)
-    test_dataset = WeatherDataset(X_test_scaled, y_delta_test_scaled, y_last_test)
+    train_dataset = WeatherDataset(X_train_scaled, y_delta_train_scaled, y_last_train, y_next_train)
+    test_dataset = WeatherDataset(X_test_scaled, y_delta_test_scaled, y_last_test, y_next_test)
     train_loader = DataLoader(train_dataset, batch_size=64, shuffle=True)
     test_loader = DataLoader(test_dataset, batch_size=64, shuffle=False)
     
@@ -210,10 +233,7 @@ def main():
     train_losses = train_model(model, train_loader, criterion, optimizer, epochs=100)
     
     print("\n评估模型...")
-    predictions_absolute, predictions_delta = evaluate_model(model, test_loader, scaler_delta)
-    
-    # 计算实际的绝对温度值
-    actuals_absolute = y_last_test + y_delta_test
+    predictions_absolute, actuals_absolute, predictions_delta, actuals_delta = evaluate_model(model, test_loader, scaler_delta)
     
     # 计算评估指标（基于绝对值）
     mse = mean_squared_error(actuals_absolute, predictions_absolute)
@@ -221,80 +241,142 @@ def main():
     mae = mean_absolute_error(actuals_absolute, predictions_absolute)
     r2 = r2_score(actuals_absolute, predictions_absolute)
     
-    metrics = {'MSE': mse, 'RMSE': rmse, 'MAE': mae, 'R2': r2}
+    # 计算Delta的评估指标
+    delta_mse = mean_squared_error(actuals_delta, predictions_delta)
+    delta_rmse = np.sqrt(delta_mse)
+    delta_mae = mean_absolute_error(actuals_delta, predictions_delta)
+    delta_r2 = r2_score(actuals_delta, predictions_delta)
     
-    print("\n模型性能（基于绝对值评估）:")
-    for metric, value in metrics.items():
-        print(f"{metric}: {value:.4f}")
+    metrics = {
+        'MSE': mse, 'RMSE': rmse, 'MAE': mae, 'R2': r2,
+        'Delta_MSE': delta_mse, 'Delta_RMSE': delta_rmse, 
+        'Delta_MAE': delta_mae, 'Delta_R2': delta_r2
+    }
     
-    # 额外输出delta的统计信息
-    delta_mae = mean_absolute_error(y_delta_test, predictions_delta)
-    delta_rmse = np.sqrt(mean_squared_error(y_delta_test, predictions_delta))
-    print(f"\nDelta预测性能:")
-    print(f"Delta MAE: {delta_mae:.4f}")
-    print(f"Delta RMSE: {delta_rmse:.4f}")
+    print("\n【关键】模型性能对比:")
+    print("="*50)
+    print("绝对温度预测性能:")
+    print(f"  MSE: {mse:.4f}, RMSE: {rmse:.4f}")
+    print(f"  MAE: {mae:.4f}, R²: {r2:.4f}")
+    print("\nDelta预测性能（真实预测能力）:")
+    print(f"  Delta MSE: {delta_mse:.4f}, Delta RMSE: {delta_rmse:.4f}")
+    print(f"  Delta MAE: {delta_mae:.4f}, Delta R²: {delta_r2:.4f}")
+    print("="*50)
+    
+    # Baseline对比
+    baseline_predictions = np.zeros_like(actuals_delta)
+    baseline_mae = mean_absolute_error(actuals_delta, baseline_predictions)
+    baseline_r2 = r2_score(actuals_delta, baseline_predictions)
+    
+    print(f"\nBaseline（预测delta=0）:")
+    print(f"  Baseline Delta MAE: {baseline_mae:.4f}")
+    print(f"  Baseline Delta R²: {baseline_r2:.4f}")
+    print(f"\n模型相对Baseline改进:")
+    print(f"  MAE改进: {(baseline_mae - delta_mae) / baseline_mae * 100:.2f}%")
+    if baseline_r2 >= 0:
+        print(f"  R²改进: {(delta_r2 - baseline_r2) / max(abs(baseline_r2), 0.01) * 100:.2f}%")
     
     # 绘制预测结果图
-    plot_predictions(actuals_absolute, predictions_absolute, "双向LSTM+时间特征+预测变化值", 
-                    os.path.join(results_dir, "step5_predictions.png"))
-    plot_scatter(actuals_absolute, predictions_absolute, "双向LSTM+时间特征+预测变化值",
-                os.path.join(results_dir, "step5_scatter.png"))
+    plot_predictions(actuals_absolute, predictions_absolute, "步骤5修正版-绝对温度", 
+                    os.path.join(results_dir, "step5_fixed_predictions_absolute.png"))
+    plot_scatter(actuals_absolute, predictions_absolute, "步骤5修正版-绝对温度",
+                os.path.join(results_dir, "step5_fixed_scatter_absolute.png"))
+    
+    # 绘制Delta预测结果
+    plot_predictions(actuals_delta, predictions_delta, "步骤5修正版-Delta预测", 
+                    os.path.join(results_dir, "step5_fixed_predictions_delta.png"), num_points=500)
+    plot_scatter(actuals_delta, predictions_delta, "步骤5修正版-Delta预测",
+                os.path.join(results_dir, "step5_fixed_scatter_delta.png"))
     
     # 生成报告
-    report_content = f"""# 步骤5: 双向LSTM + 时间特征 + 预测变化值 实验报告
+    report_content = f"""# 步骤5修正版: 双向LSTM + 时间特征 + 预测变化值（含OT历史）
 
 生成时间: {pd.Timestamp.now().strftime('%Y-%m-%d %H:%M:%S')}
 
-## 实验设计
+## 关键修正
 
-本实验基于步骤4的双向LSTM模型，但采用了不同的预测策略：
-- **预测目标改进**: 预测温度变化值（delta）而非绝对温度值
-- **预测公式**: OT(t+1) = OT(t) + Δ，其中Δ = OT(t+1) - OT(t)
-- **优势**: 变化值通常比绝对值更平稳，且更容易捕捉温度变化趋势
+本实验修正了原步骤5的评估问题：
+- **修正前**: 输入特征不包含OT历史，导致评估不公平
+- **修正后**: 输入特征包含OT历史（28维特征），模型可以学习温度模式
+- **评估改进**: 同时报告绝对值和Delta的R²，分离"信息优势"和"模型能力"
 
 ## 模型架构
 
-- 输入: 过去12个时间步的27维特征（21个气象特征 + 6个周期性时间特征）
+- 输入: 过去12个时间步的28维特征（21个气象特征 + **OT历史** + 6个周期性时间特征）
 - BiLSTM: 2层，64隐藏单元，双向结构
 - 全连接层: 64 -> 32 -> 1
 - Dropout: 0.2
 - 激活函数: ReLU
 
-## 性能指标（基于绝对值评估）
+## 性能指标
+
+### 绝对温度预测性能
 
 | 指标 | 值 |
 |------|------|
 | MSE | {mse:.4f} |
 | RMSE | {rmse:.4f} |
 | MAE | {mae:.4f} |
-| R2 | {r2:.4f} |
+| R² | {r2:.4f} |
 
-## Delta预测性能
+### Delta预测性能（真实预测能力）
 
 | 指标 | 值 |
 |------|------|
-| Delta MAE | {delta_mae:.4f} |
+| Delta MSE | {delta_mse:.4f} |
 | Delta RMSE | {delta_rmse:.4f} |
+| Delta MAE | {delta_mae:.4f} |
+| **Delta R²** | **{delta_r2:.4f}** |
+
+### Baseline对比
+
+| 指标 | Baseline (delta=0) | 模型 | 改进 |
+|------|-------------------|------|------|
+| Delta MAE | {baseline_mae:.4f} | {delta_mae:.4f} | {(baseline_mae - delta_mae) / baseline_mae * 100:.2f}% |
+| Delta R² | {baseline_r2:.4f} | {delta_r2:.4f} | - |
+
+## 与其他步骤对比
+
+| 步骤 | 预测目标 | 包含OT历史 | R²（可比） | MAE |
+|------|---------|-----------|-----------|-----|
+| 步骤4 | 绝对值 | ✅ | 0.5688 | 8.70°C |
+| 步骤5原版 | Delta | ❌ | ~~0.9734~~（虚高） | 2.11°C |
+| **步骤5修正版** | **Delta** | **✅** | **{delta_r2:.4f}** | **{delta_mae:.4f}°C** |
 
 ## 实验结论
 
-通过预测变化值而非绝对值，模型能够更好地：
-1. 捕捉温度的短期变化趋势
-2. 减少累积误差的影响
-3. 提高对温度波动的敏感性
+1. **修正后的真实性能**：
+   - Delta R² = {delta_r2:.4f}（真实预测能力）
+   - 相比步骤4的R²=0.57，{'提升' if delta_r2 > 0.57 else '下降'}了{abs(delta_r2 - 0.57) / 0.57 * 100:.1f}%
+
+2. **预测Delta vs 预测绝对值**：
+   - Delta MAE更小是因为预测目标本身更小
+   - 真实预测能力应看Delta R²，而非绝对值R²
+
+3. **包含OT历史的重要性**：
+   - 模型可以学习温度的时间模式
+   - 评估更公平，不依赖外部的y_last信息
 
 ## 图表
 
-- 预测结果对比图: `results/step5_predictions.png`
-- 预测散点图: `results/step5_scatter.png`
+- 绝对温度预测对比图: `results/step5_fixed_predictions_absolute.png`
+- 绝对温度散点图: `results/step5_fixed_scatter_absolute.png`
+- Delta预测对比图: `results/step5_fixed_predictions_delta.png`
+- Delta散点图: `results/step5_fixed_scatter_delta.png`
+
+## 下一步建议
+
+1. **如果Delta R² > 0.57**: 说明预测delta确实比预测绝对值更好
+2. **如果Delta R² < 0.57**: 考虑继续使用步骤4的绝对值预测
+3. **进一步改进**: 添加注意力机制、尝试Transformer等
 """
     
-    report_path = os.path.join(docs_dir, "step5_report.md")
+    report_path = os.path.join(docs_dir, "step5_fixed_report.md")
     with open(report_path, 'w', encoding='utf-8') as f:
         f.write(report_content)
     
     print("\n" + "="*50)
-    print("步骤5完成！")
+    print("步骤5修正版完成！")
     print(f"结果已保存至: {results_dir}")
     print(f"报告已保存至: {report_path}")
     print("="*50)

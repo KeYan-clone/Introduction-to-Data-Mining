@@ -83,27 +83,30 @@ def create_feature_target_sequences(features, target, seq_length=12):
     return np.array(X), np.array(y)
 
 def create_feature_target_sequences_with_delta(features, target, seq_length=12):
-    """Create sequences and return delta and last-value in raw space.
+    """Create sequences and return delta, last-value and next-value in raw space.
 
-    returns X: (N-seq_length, seq_length, F), y_delta: (N-seq_length,), y_last: (N-seq_length,)
+    returns X: (N-seq_length, seq_length, F), y_delta: (N-seq_length,), y_last: (N-seq_length,), y_next: (N-seq_length,)
     where y_delta = target[t+seq_length] - target[t+seq_length-1]
-    and y_last = target[t+seq_length-1]
+    y_last = target[t+seq_length-1] (OT at time t)
+    y_next = target[t+seq_length] (OT at time t+1, ground truth)
     """
-    X, y_delta, y_last = [], [], []
+    X, y_delta, y_last, y_next = [], [], [], []
     tgt = target.reshape(-1)
     for i in range(len(features) - seq_length):
         X.append(features[i:i+seq_length])
-        last_temp = tgt[i+seq_length-1]
-        next_temp = tgt[i+seq_length]
+        last_temp = tgt[i+seq_length-1]  # OT_t
+        next_temp = tgt[i+seq_length]     # OT_{t+1}
         y_delta.append(next_temp - last_temp)
         y_last.append(last_temp)
-    return np.array(X), np.array(y_delta), np.array(y_last)
+        y_next.append(next_temp)
+    return np.array(X), np.array(y_delta), np.array(y_last), np.array(y_next)
 
 class WeatherDataset(Dataset):
-    def __init__(self, X, y, y_last=None):
+    def __init__(self, X, y, y_last=None, y_next=None):
         self.X = torch.FloatTensor(X)
         self.y = torch.FloatTensor(y)
         self.y_last = torch.FloatTensor(y_last) if y_last is not None else None
+        self.y_next = torch.FloatTensor(y_next) if y_next is not None else None
 
     def __len__(self):
         return len(self.X)
@@ -111,7 +114,9 @@ class WeatherDataset(Dataset):
     def __getitem__(self, idx):
         if self.y_last is None:
             return self.X[idx], self.y[idx]
-        return self.X[idx], self.y[idx], self.y_last[idx]
+        if self.y_next is None:
+            return self.X[idx], self.y[idx], self.y_last[idx]
+        return self.X[idx], self.y[idx], self.y_last[idx], self.y_next[idx]
 
 def plot_predictions(actuals, predictions, model_name, save_path, num_points=500):
     plt.figure(figsize=(15, 6))

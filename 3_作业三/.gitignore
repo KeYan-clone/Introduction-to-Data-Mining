@@ -1,4 +1,6 @@
 # Ignore CSV files in assignment 3 directory
 data/
 docs/
+results/
 code/__pycache__/
+report.txt
